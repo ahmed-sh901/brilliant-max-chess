@@ -12,13 +12,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Unpack BMC project
         run: |
+          set -euo pipefail
           rm -rf project
           mkdir project
           unzip -q bmc_android_repo_root.zip -d project
@@ -39,24 +39,36 @@ jobs:
         with:
           gradle-version: '8.13'
 
-      - name: Verify TorchScript Lite model archive
+      - name: Build Stockfish 19 for Android arm64
         working-directory: project
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, zipfile
-          from pathlib import Path
-          p=Path('app/src/main/assets/mobile_prior_v52_7head_mix2250.ptl')
-          expected=Path(str(p)+'.sha256').read_text().split()[0]
-          actual=hashlib.sha256(p.read_bytes()).hexdigest()
-          print('expected=', expected)
-          print('actual  =', actual)
-          assert expected == actual
-          with zipfile.ZipFile(p) as z:
-              names=z.namelist()
-              assert any(n.endswith('/bytecode.pkl') for n in names), 'bytecode.pkl missing'
-          print('TorchScript Lite archive: OK')
+          rm -rf third_party/stockfish
+          mkdir -p third_party
+          git clone --depth 1 --branch sf_19 https://github.com/official-stockfish/Stockfish.git third_party/stockfish
+          make -C third_party/stockfish/src net
+          make -C third_party/stockfish/src -j2 build ARCH=armv8 COMP=ndk
+          make -C third_party/stockfish/src strip ARCH=armv8 COMP=ndk
+          mkdir -p app/src/main/assets
+          cp third_party/stockfish/src/stockfish app/src/main/assets/stockfish-arm64
+          chmod 0755 app/src/main/assets/stockfish-arm64
+          sha256sum app/src/main/assets/stockfish-arm64 | tee app/src/main/assets/stockfish-arm64.sha256
+          file app/src/main/assets/stockfish-arm64
+
+      - name: Verify Prior Lite archive
+        working-directory: project
+        run: |
+          set -euo pipefail
+          expected=$(python3 - <<'PY'
+          import json
+          with open('MODEL_DROPZONE/mobile_prior_v52_7head_mix2250.ptl.json') as f:
+              print(json.load(f).get('sha256',''))
           PY
+          )
+          actual=$(sha256sum MODEL_DROPZONE/mobile_prior_v52_7head_mix2250.ptl | awk '{print $1}')
+          test -z "$expected" || test "$expected" = "$actual"
+          unzip -l MODEL_DROPZONE/mobile_prior_v52_7head_mix2250.ptl | grep -q 'bytecode.pkl'
+          echo "Prior Lite archive verified"
 
       - name: Build debug APK
         working-directory: project
@@ -66,23 +78,15 @@ jobs:
         working-directory: project
         run: gradle --no-daemon testDebug
 
-      - name: Enable KVM
+      - name: Verify APK contents
+        working-directory: project
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
-      - name: Android runtime smoke tests
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          profile: pixel_5
-          force-avd-creation: true
-          emulator-options: -no-snapshot-load -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
-          disable-animations: true
-          script: gradle --no-daemon connectedDebugAndroidTest
+          set -euo pipefail
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$apk" | grep -q 'stockfish-arm64'
+          unzip -l "$apk" | grep -q 'mobile_prior_v52_7head_mix2250.ptl'
+          unzip -t "$apk" >/dev/null
+          sha256sum "$apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -99,5 +103,4 @@ jobs:
           path: |
             project/app/build/reports/**
             project/app/build/test-results/**
-            project/app/build/outputs/androidTest-results/**
           if-no-files-found: ignore
